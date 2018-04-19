@@ -55,23 +55,34 @@ x = 5
 y = 3
 
 
+#shared memory between the threads
 results = np.empty((batch_size,y,x), np.dtype('U'))
 curr_batch = 0
 
+#locks to manage the threads
 gen_lock = threading.Lock()
 w_turn = threading.Condition()
 writing = threading.Event()
 read_ok = threading.Event()
 write_ok = threading.Event()
 
+
 def generator_of_files():
+    '''gives a file from a list of data files, in a meaningful order.  Here we are simply
+    making sure we go through one full epoch before repeatings, and shuffling the order
+    between epochs.'''
+
     while(1):
         random.shuffle(files)
         for f in files:
             yield f
 
+
 def threaded_writer(instance_gen_of_files, x, y, batch_size, i):
-    #a = np.random.randint(0,10)
+    '''many of these will take turns writing to the shared results array, one example at
+    a time, until batch_size examples have been written.  This should greatly diminish
+    any bottlenecks due to file i/o or numpy preprocessing.'''
+
     global results
     global curr_batch
 
@@ -82,32 +93,39 @@ def threaded_writer(instance_gen_of_files, x, y, batch_size, i):
 
         #open it and formulate the value properly
         with open(f_str, 'r') as f:
+
+            #here should go numpy preprocessing code, for this example it's just reading in the file
             for line in f:
                 val = np.array([[line]*x]*y)
 
-                #take out the turn lock to write to batch, set rw_flags if necessary, update batch num, notify other threads
                 with w_turn:
-                    #wait for the thread to be tapped to write, wait for writing to be ok
 
+                    #if someone is writing, wait your turn (for w_turn to notify you)
                     if writing.is_set():
                         w_turn.wait()
 
+                    #it's our turn!  Set the writing flag and make sure our shared memory is ready to be written
                     writing.set()
                     write_ok.wait()
-                    #update result, increase pointer into result
+
+                    #update result, increase pointer for current example in batch of result
                     results[curr_batch,:,:] = val
                     curr_batch = curr_batch + 1
-                    #if filled a batch, turn to read mode
+
+                    #if we've filled a batch, put ourselves in read mode and turn off write mode
                     if curr_batch == batch_size:
                         write_ok.clear()
                         read_ok.set()
 
-                    #queue up next thread_writer
+                    #we're done writing, notify the next thread_writer
                     writing.clear()
                     w_turn.notify(n=1)
 
+
 def consumer():
-    '''meant to be initiated exactly once'''
+    '''meant to be initiated exactly once, this will yield batches from the
+    shared results array that is being written into by many threaded_writer
+    processes.  It is a generator.'''
 
     global results
     global curr_batch
@@ -117,14 +135,17 @@ def consumer():
     write_ok.set()
 
     while (1):
-        #keep waiting on the read_ok to be set
+        #wait to be told it's ok to read (aka we have a full results array)
         read_ok.wait()
-        #when set, grab a copy of results, reset batch placeholder
+
+        #our turn! grab a copy of results, reset batch placeholder
         to_return = np.array(results, copy=True)
         curr_batch = 0
-        #unset read_ok, set write_ok
+
+        #unset read_ok, set write_ok so the writers can continue
         write_ok.set()
         read_ok.clear()
+
         #yield
         yield to_return
 
@@ -132,15 +153,20 @@ def consumer():
 
 if __name__ == '__main__':
 
+    #create an instance of the file generator
     test_gen = generator_of_files()
 
+    #pass it to num_threads workers, along with some other basic configurations
+    #set them as Daemons so they die with the program/main generator
     for i in range(num_threads):
         worker = threading.Thread(target=threaded_writer, args=(test_gen, x, y, batch_size, i))
         worker.setDaemon(True)
         worker.start()
 
+    #create an instance of the consumer
     consume_gen = consumer()
 
+    #yield num_yields batches, and time it to see how well it does.
     start = time.time()
 
     num_yields = 1000
@@ -149,6 +175,7 @@ if __name__ == '__main__':
 
     end = time.time()
 
+    #print the results
     print str(end-start) + ' seconds elapsed'
     print str((end-start)/float(num_yields)) + ' s avg yield'
 
